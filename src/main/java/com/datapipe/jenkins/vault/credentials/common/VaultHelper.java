@@ -14,15 +14,20 @@ import com.datapipe.jenkins.vault.exception.VaultPluginException;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.ExtensionList;
+import hudson.Util;
 import hudson.model.Item;
 import hudson.model.ItemGroup;
 import hudson.security.ACL;
+import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.commons.lang.StringUtils;
+import jenkins.security.SlaveToMasterCallable;
+import hudson.remoting.Channel;
+
 
 public class VaultHelper {
 
@@ -33,59 +38,98 @@ public class VaultHelper {
                                               @CheckForNull String namespace,
                                               @CheckForNull Integer engineVersion,
                                               @NonNull ItemGroup<Item> context) {
-        VaultConfiguration configuration = null;
-        for (VaultConfigResolver resolver : ExtensionList.lookup(VaultConfigResolver.class)) {
-            if (configuration != null) {
-                configuration = configuration
-                        .mergeWithParent(resolver.getVaultConfig(context));
+        try {
+            Map<String, String> secrets;
+            SecretRetrieve retrieve = new SecretRetrieve(secretPath, prefixPath, namespace,
+                engineVersion, context);
+
+            Channel channel = Channel.current();
+            if (channel == null) {
+                secrets = retrieve.call();
             } else {
-                configuration = resolver.getVaultConfig(context);
+                LOGGER.fine("Sending request for getVaultSecret(...) to master");
+                secrets = channel.call(retrieve);
             }
+
+            return secrets;
+        } catch (IOException | InterruptedException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static class SecretRetrieve extends SlaveToMasterCallable<Map<String, String>, IOException> {
+        private static final long serialVersionUID = 1L;
+        private final String secretPath;
+        @CheckForNull
+        private final String prefixPath;
+        @CheckForNull
+        private final String namespace;
+        @CheckForNull
+        private Integer engineVersion;
+        private final ItemGroup<Item> context;
+
+        SecretRetrieve(String secretPath, String prefixPath, String namespace, Integer engineVersion, ItemGroup<Item> context) {
+            this.secretPath = secretPath;
+            this.prefixPath = Util.fixEmptyAndTrim(prefixPath);
+            this.namespace = Util.fixEmptyAndTrim(prefixPath);
+            this.engineVersion = engineVersion;
+            this.context = context;
         }
 
-        if (configuration == null) {
-            throw new IllegalStateException("Vault plugin has not been configured.");
-        }
+        public Map<String, String> call() throws IOException {
+            VaultConfiguration configuration = null;
+            for (VaultConfigResolver resolver : ExtensionList.lookup(VaultConfigResolver.class)) {
+                if (configuration != null) {
+                    configuration = configuration
+                        .mergeWithParent(resolver.getVaultConfig(context));
+                } else {
+                    configuration = resolver.getVaultConfig(context);
+                }
+            }
 
-        configuration.fixDefaults();
-        if (engineVersion == null) {
-            engineVersion = configuration.getEngineVersion();
-        }
+            if (configuration == null) {
+                throw new IllegalStateException("Vault plugin has not been configured.");
+            }
 
-        String msg = String.format(
+            configuration.fixDefaults();
+            if (engineVersion == null) {
+                engineVersion = configuration.getEngineVersion();
+            }
+
+            String msg = String.format(
                 "Retrieving vault secret path=%s engineVersion=%s",
                 secretPath, engineVersion);
-        LOGGER.info(msg);
+            LOGGER.info(msg);
 
-        try {
-            VaultConfig vaultConfig = configuration.getVaultConfig();
+            try {
+                VaultConfig vaultConfig = configuration.getVaultConfig();
 
-            if (prefixPath != null && ! prefixPath.isEmpty()) {
-                vaultConfig.prefixPath(prefixPath);
-            }
+                if (prefixPath != null && ! prefixPath.isEmpty()) {
+                    vaultConfig.prefixPath(prefixPath);
+                }
 
-            if (namespace != null && ! namespace.isEmpty()) {
-                vaultConfig.nameSpace(namespace);
-            }
+                if (namespace != null && ! namespace.isEmpty()) {
+                    vaultConfig.nameSpace(namespace);
+                }
 
-            VaultCredential vaultCredential = configuration.getVaultCredential();
-            if (vaultCredential == null)
-                vaultCredential = retrieveVaultCredentials(
+                VaultCredential vaultCredential = configuration.getVaultCredential();
+                if (vaultCredential == null)
+                    vaultCredential = retrieveVaultCredentials(
                         configuration.getVaultCredentialId(), context);
 
-            VaultAccessor vaultAccessor = new VaultAccessor(vaultConfig, vaultCredential);
-            vaultAccessor.setMaxRetries(configuration.getMaxRetries());
-            vaultAccessor.setRetryIntervalMilliseconds(
+                VaultAccessor vaultAccessor = new VaultAccessor(vaultConfig, vaultCredential);
+                vaultAccessor.setMaxRetries(configuration.getMaxRetries());
+                vaultAccessor.setRetryIntervalMilliseconds(
                     configuration.getRetryIntervalMilliseconds());
-            vaultAccessor.init();
+                vaultAccessor.init();
 
-            return vaultAccessor.read(secretPath, engineVersion).getData();
-        } catch (VaultPluginException vpe) {
-            throw vpe;
-        } catch (Exception e) {
-            throw new RuntimeException(e);
+                return vaultAccessor.read(secretPath, engineVersion).getData();
+            } catch (VaultPluginException vpe) {
+                throw vpe;
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
         }
-
     }
 
     static String getVaultSecretKey(@NonNull String secretPath,
